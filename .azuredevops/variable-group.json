@@ -1,0 +1,31 @@
+{
+  "_comment": "Import this into Azure DevOps via: az pipelines variable-group create --variables @variable-group.json --name terraform-backend --project <PROJECT>",
+  "description": "Variables required by the IAC_AZURE_AUTOMATION_PIPELINE Terraform pipeline",
+  "variables": {
+    "ARM_SUBSCRIPTION_ID": {
+      "value": "REPLACE_WITH_YOUR_SUBSCRIPTION_ID",
+      "isSecret": false
+    },
+    "ARM_TENANT_ID": {
+      "value": "REPLACE_WITH_YOUR_TENANT_ID",
+      "isSecret": false
+    },
+    "TF_BACKEND_RG": {
+      "value": "tfstate-rg",
+      "isSecret": false
+    },
+    "TF_BACKEND_SA": {
+      "value": "REPLACE_WITH_YOUR_STORAGE_ACCOUNT_NAME",
+      "isSecret": false
+    },
+    "TF_BACKEND_CONTAINER": {
+      "value": "tfstate",
+      "isSecret": false
+    },
+    "SSH_PUBLIC_KEY": {
+      "value": "",
+      "isSecret": true,
+      "_comment": "Paste your SSH public key here, or leave blank to use auto-generated password auth"
+    }
+  }
+}

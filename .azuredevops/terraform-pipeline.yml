@@ -1,0 +1,239 @@
+# ============================================================
+# Azure DevOps Pipeline – IAC_AZURE_AUTOMATION_PIPELINE
+# Trigger: push / PR to main branch of the GitHub repo
+# Stages: Validate → Plan → Apply (gated)
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".azuredevops/terraform-pipeline.yml"
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - "**/*.tf"
+      - "**/*.tfvars"
+
+# ── Variables ─────────────────────────────────────────────────────────────────
+variables:
+  # Azure service connection name (set in Project Settings → Service Connections)
+  AZURE_SERVICE_CONNECTION: "azure-service-connection"
+
+  # Azure subscription / tenant (override in pipeline variable group if needed)
+  ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
+  ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+
+  # Terraform version to install
+  TF_VERSION: "1.9.8"
+
+  # Working directory – relative path inside the repo
+  TF_WORKING_DIR: "$(System.DefaultWorkingDirectory)"
+
+  # Azure Blob backend – set these in a variable group named 'terraform-backend'
+  BACKEND_RESOURCE_GROUP: "$(TF_BACKEND_RG)"
+  BACKEND_STORAGE_ACCOUNT: "$(TF_BACKEND_SA)"
+  BACKEND_CONTAINER: "$(TF_BACKEND_CONTAINER)"
+  BACKEND_KEY: "IAC_azure_automation_pipeline/terraform.tfstate"
+
+  # SSH public key for VM (stored as a secret pipeline variable or Key Vault link)
+  # Leave empty to let the module auto-generate a password instead.
+  TF_VAR_ssh_public_key: "$(SSH_PUBLIC_KEY)"
+
+# ── Pool ──────────────────────────────────────────────────────────────────────
+pool:
+  vmImage: "ubuntu-latest"
+
+# ── Stages ────────────────────────────────────────────────────────────────────
+stages:
+
+  # ── Stage 1: Validate ───────────────────────────────────────────────────────
+  - stage: Validate
+    displayName: "Terraform Validate"
+    jobs:
+      - job: TerraformValidate
+        displayName: "fmt + validate"
+        steps:
+
+          # 1. Checkout from GitHub
+          - checkout: self
+            displayName: "Checkout source from GitHub"
+            fetchDepth: 0
+
+          # 2. Install Terraform
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform $(TF_VERSION)"
+            inputs:
+              terraformVersion: "$(TF_VERSION)"
+
+          # 3. terraform init (read-only – no backend state operations)
+          - task: TerraformTaskV4@4
+            displayName: "terraform init"
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              workingDirectory: "$(TF_WORKING_DIR)"
+              backendServiceArm: "$(AZURE_SERVICE_CONNECTION)"
+              backendAzureRmResourceGroupName: "$(BACKEND_RESOURCE_GROUP)"
+              backendAzureRmStorageAccountName: "$(BACKEND_STORAGE_ACCOUNT)"
+              backendAzureRmContainerName: "$(BACKEND_CONTAINER)"
+              backendAzureRmKey: "$(BACKEND_KEY)"
+
+          # 4. terraform fmt check
+          - task: TerraformTaskV4@4
+            displayName: "terraform fmt -check"
+            inputs:
+              provider: "azurerm"
+              command: "custom"
+              workingDirectory: "$(TF_WORKING_DIR)"
+              customCommand: "fmt"
+              commandOptions: "-check -recursive -diff"
+
+          # 5. terraform validate
+          - task: TerraformTaskV4@4
+            displayName: "terraform validate"
+            inputs:
+              provider: "azurerm"
+              command: "validate"
+              workingDirectory: "$(TF_WORKING_DIR)"
+
+  # ── Stage 2: Plan ────────────────────────────────────────────────────────────
+  - stage: Plan
+    displayName: "Terraform Plan"
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: TerraformPlan
+        displayName: "terraform plan"
+        steps:
+
+          - checkout: self
+            displayName: "Checkout source from GitHub"
+            fetchDepth: 0
+
+          - task: TerraformInstaller@1
+            displayName: "Install Terraform $(TF_VERSION)"
+            inputs:
+              terraformVersion: "$(TF_VERSION)"
+
+          - task: TerraformTaskV4@4
+            displayName: "terraform init"
+            inputs:
+              provider: "azurerm"
+              command: "init"
+              workingDirectory: "$(TF_WORKING_DIR)"
+              backendServiceArm: "$(AZURE_SERVICE_CONNECTION)"
+              backendAzureRmResourceGroupName: "$(BACKEND_RESOURCE_GROUP)"
+              backendAzureRmStorageAccountName: "$(BACKEND_STORAGE_ACCOUNT)"
+              backendAzureRmContainerName: "$(BACKEND_CONTAINER)"
+              backendAzureRmKey: "$(BACKEND_KEY)"
+
+          - task: TerraformTaskV4@4
+            displayName: "terraform plan"
+            inputs:
+              provider: "azurerm"
+              command: "plan"
+              workingDirectory: "$(TF_WORKING_DIR)"
+              environmentServiceNameAzureRM: "$(AZURE_SERVICE_CONNECTION)"
+              commandOptions: >-
+                -out=$(Pipeline.Workspace)/tfplan
+                -var="ssh_public_key=$(TF_VAR_ssh_public_key)"
+                -detailed-exitcode
+            env:
+              ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
+              ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+
+          # Publish the plan file so the Apply stage can consume it
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish plan artifact"
+            inputs:
+              targetPath: "$(Pipeline.Workspace)/tfplan"
+              artifact: "tfplan"
+              publishLocation: "pipeline"
+
+          # Save the full plan output as a readable summary
+          - bash: |
+              cd "$(TF_WORKING_DIR)"
+              terraform show -no-color $(Pipeline.Workspace)/tfplan > $(Pipeline.Workspace)/tfplan.txt
+              echo "##vso[task.uploadsummary]$(Pipeline.Workspace)/tfplan.txt"
+            displayName: "Show plan summary"
+
+  # ── Stage 3: Apply (manual approval gate on main branch) ─────────────────────
+  - stage: Apply
+    displayName: "Terraform Apply"
+    dependsOn: Plan
+    # Only auto-run on main; feature branches stop after Plan
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      # Approval gate – requires an environment named 'production' in Azure DevOps
+      # with an Approvals check configured (Project Settings → Environments).
+      - deployment: TerraformApply
+        displayName: "terraform apply"
+        environment: "production"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                - checkout: self
+                  displayName: "Checkout source from GitHub"
+                  fetchDepth: 0
+
+                - task: TerraformInstaller@1
+                  displayName: "Install Terraform $(TF_VERSION)"
+                  inputs:
+                    terraformVersion: "$(TF_VERSION)"
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform init"
+                  inputs:
+                    provider: "azurerm"
+                    command: "init"
+                    workingDirectory: "$(TF_WORKING_DIR)"
+                    backendServiceArm: "$(AZURE_SERVICE_CONNECTION)"
+                    backendAzureRmResourceGroupName: "$(BACKEND_RESOURCE_GROUP)"
+                    backendAzureRmStorageAccountName: "$(BACKEND_CONTAINER)"
+                    backendAzureRmContainerName: "$(BACKEND_CONTAINER)"
+                    backendAzureRmKey: "$(BACKEND_KEY)"
+
+                # Download the plan file created in the Plan stage
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download plan artifact"
+                  inputs:
+                    artifact: "tfplan"
+                    path: "$(Pipeline.Workspace)/tfplan"
+
+                - task: TerraformTaskV4@4
+                  displayName: "terraform apply"
+                  inputs:
+                    provider: "azurerm"
+                    command: "apply"
+                    workingDirectory: "$(TF_WORKING_DIR)"
+                    environmentServiceNameAzureRM: "$(AZURE_SERVICE_CONNECTION)"
+                    commandOptions: "-auto-approve $(Pipeline.Workspace)/tfplan"
+                  env:
+                    ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
+                    ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+
+                # Print sensitive outputs (masked by ADO secret variable handling)
+                - bash: |
+                    cd "$(TF_WORKING_DIR)"
+                    echo "=== Terraform Outputs ==="
+                    terraform output -json
+                  displayName: "Show Terraform outputs"
+                  env:
+                    ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
+                    ARM_TENANT_ID: "$(ARM_TENANT_ID)"
