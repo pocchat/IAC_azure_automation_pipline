@@ -26,28 +26,35 @@ pr:
 
 # ── Variables ─────────────────────────────────────────────────────────────────
 variables:
-  # Azure service connection name (set in Project Settings → Service Connections)
-  AZURE_SERVICE_CONNECTION: "azure-service-connection"
+  # Pull ARM_*, TF_BACKEND_*, and SSH_PUBLIC_KEY from the 'terraform-backend' variable group
+  - group: terraform-backend
 
-  # Azure subscription / tenant (override in pipeline variable group if needed)
-  ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
-  ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+  # Azure service connection name (set in Project Settings → Service Connections)
+  - name: AZURE_SERVICE_CONNECTION
+    value: "azure-service-connection"
 
   # Terraform version to install
-  TF_VERSION: "1.9.8"
+  - name: TF_VERSION
+    value: "1.9.8"
 
   # Working directory – relative path inside the repo
-  TF_WORKING_DIR: "$(System.DefaultWorkingDirectory)"
+  - name: TF_WORKING_DIR
+    value: "$(System.DefaultWorkingDirectory)"
 
-  # Azure Blob backend – set these in a variable group named 'terraform-backend'
-  BACKEND_RESOURCE_GROUP: "$(TF_BACKEND_RG)"
-  BACKEND_STORAGE_ACCOUNT: "$(TF_BACKEND_SA)"
-  BACKEND_CONTAINER: "$(TF_BACKEND_CONTAINER)"
-  BACKEND_KEY: "IAC_azure_automation_pipeline/terraform.tfstate"
+  # Azure Blob backend – mapped from variable group values
+  - name: BACKEND_RESOURCE_GROUP
+    value: "$(TF_BACKEND_RG)"
+  - name: BACKEND_STORAGE_ACCOUNT
+    value: "$(TF_BACKEND_SA)"
+  - name: BACKEND_CONTAINER
+    value: "$(TF_BACKEND_CONTAINER)"
+  - name: BACKEND_KEY
+    value: "IAC_azure_automation_pipeline/terraform.tfstate"
 
-  # SSH public key for VM (stored as a secret pipeline variable or Key Vault link)
+  # SSH public key for VM – from variable group secret SSH_PUBLIC_KEY
   # Leave empty to let the module auto-generate a password instead.
-  TF_VAR_ssh_public_key: "$(SSH_PUBLIC_KEY)"
+  - name: TF_VAR_ssh_public_key
+    value: "$(SSH_PUBLIC_KEY)"
 
 # ── Pool ──────────────────────────────────────────────────────────────────────
 pool:
