@@ -3,6 +3,7 @@
 # Trigger: push / PR to main branch of the GitHub repo
 # Stages: Validate → Plan → Apply (gated on main)
 # Uses only built-in ADO tasks – no marketplace extensions required.
+# Compatible with both Linux (Microsoft-hosted) and Windows (self-hosted) agents.
 # ============================================================
 
 trigger:
@@ -57,11 +58,11 @@ variables:
     value: "$(SSH_PUBLIC_KEY)"
 
 # ── Pool ──────────────────────────────────────────────────────────────────────
+# Uses the 'Default' pool which maps to the self-hosted agent (win-local-agent).
+# To switch back to Microsoft-hosted runners (requires purchased parallelism),
+# replace the pool block with:  pool: { vmImage: "ubuntu-latest" }
 pool:
-  vmImage: "ubuntu-latest"
-
-# ── Shared step template: install Terraform ───────────────────────────────────
-# Referenced in each stage via a bash step (no marketplace extension needed).
+  name: "Default"
 
 # ── Stages ────────────────────────────────────────────────────────────────────
 stages:
@@ -78,15 +79,27 @@ stages:
             displayName: "Checkout source from GitHub"
             fetchDepth: 0
 
-          # Install Terraform from HashiCorp releases (no marketplace needed)
+          # Install Terraform – works on both Linux and Windows (Git Bash)
           - bash: |
               set -euo pipefail
-              echo "Installing Terraform $(TF_VERSION)..."
-              curl -fsSL "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip" \
-                -o /tmp/terraform.zip
-              unzip -o /tmp/terraform.zip -d /tmp
-              sudo mv /tmp/terraform /usr/local/bin/terraform
-              terraform version
+              TF_VER="$(TF_VERSION)"
+              TF_DIR="$HOME/.terraform-bin"
+              mkdir -p "$TF_DIR"
+
+              # Pick the right platform zip
+              if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OS" == "Windows_NT" ]]; then
+                PLATFORM="windows_amd64"; EXT=".exe"
+              else
+                PLATFORM="linux_amd64"; EXT=""
+              fi
+
+              echo "Installing Terraform $TF_VER for $PLATFORM..."
+              curl -fsSL \
+                "https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_${PLATFORM}.zip" \
+                -o "$TF_DIR/terraform.zip"
+              unzip -o "$TF_DIR/terraform.zip" -d "$TF_DIR"
+              echo "##vso[task.prependpath]$TF_DIR"
+              "$TF_DIR/terraform${EXT}" version
             displayName: "Install Terraform $(TF_VERSION)"
 
           # terraform init + fmt + validate via AzureCLI@2 (built-in)
@@ -103,6 +116,10 @@ stages:
                 export ARM_CLIENT_SECRET=$servicePrincipalKey
                 export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
                 export ARM_TENANT_ID=$(ARM_TENANT_ID)
+
+                # Ensure terraform is on PATH (set by previous step)
+                TF_DIR="$HOME/.terraform-bin"
+                export PATH="$TF_DIR:$PATH"
 
                 cd "$(TF_WORKING_DIR)"
 
@@ -135,12 +152,23 @@ stages:
 
           - bash: |
               set -euo pipefail
-              echo "Installing Terraform $(TF_VERSION)..."
-              curl -fsSL "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip" \
-                -o /tmp/terraform.zip
-              unzip -o /tmp/terraform.zip -d /tmp
-              sudo mv /tmp/terraform /usr/local/bin/terraform
-              terraform version
+              TF_VER="$(TF_VERSION)"
+              TF_DIR="$HOME/.terraform-bin"
+              mkdir -p "$TF_DIR"
+
+              if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OS" == "Windows_NT" ]]; then
+                PLATFORM="windows_amd64"; EXT=".exe"
+              else
+                PLATFORM="linux_amd64"; EXT=""
+              fi
+
+              echo "Installing Terraform $TF_VER for $PLATFORM..."
+              curl -fsSL \
+                "https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_${PLATFORM}.zip" \
+                -o "$TF_DIR/terraform.zip"
+              unzip -o "$TF_DIR/terraform.zip" -d "$TF_DIR"
+              echo "##vso[task.prependpath]$TF_DIR"
+              "$TF_DIR/terraform${EXT}" version
             displayName: "Install Terraform $(TF_VERSION)"
 
           - task: AzureCLI@2
@@ -157,6 +185,12 @@ stages:
                 export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
                 export ARM_TENANT_ID=$(ARM_TENANT_ID)
 
+                TF_DIR="$HOME/.terraform-bin"
+                export PATH="$TF_DIR:$PATH"
+
+                PLAN_OUT="$(Pipeline.Workspace)/tfplan"
+                mkdir -p "$PLAN_OUT"
+
                 cd "$(TF_WORKING_DIR)"
 
                 echo "--- terraform init ---"
@@ -167,25 +201,23 @@ stages:
                   -backend-config="key=$(BACKEND_KEY)"
 
                 echo "--- terraform plan ---"
-                # -detailed-exitcode: 0=no changes, 1=error, 2=changes present
                 terraform plan \
-                  -out="$(Pipeline.Workspace)/tfplan" \
+                  -out="$PLAN_OUT/tfplan" \
                   -var="ssh_public_key=$(TF_VAR_ssh_public_key)" \
                   -detailed-exitcode || PLAN_EXIT=$?
 
-                # Exit code 2 means "changes to apply" – not an error
                 if [ "${PLAN_EXIT:-0}" -eq 2 ]; then
-                  echo "Plan has changes. Proceeding."
+                  echo "Plan has changes – proceeding."
                 elif [ "${PLAN_EXIT:-0}" -eq 1 ]; then
                   echo "Plan failed." && exit 1
                 fi
 
-                echo "--- terraform show (human-readable summary) ---"
-                terraform show -no-color "$(Pipeline.Workspace)/tfplan" \
-                  | tee "$(Pipeline.Workspace)/tfplan.txt"
-                echo "##vso[task.uploadsummary]$(Pipeline.Workspace)/tfplan.txt"
+                echo "--- plan summary ---"
+                terraform show -no-color "$PLAN_OUT/tfplan" \
+                  | tee "$PLAN_OUT/tfplan.txt"
+                echo "##vso[task.uploadsummary]$PLAN_OUT/tfplan.txt"
 
-          # Publish plan binary as pipeline artifact for the Apply stage
+          # Publish plan binary so Apply stage can download it
           - task: PublishPipelineArtifact@1
             displayName: "Publish plan artifact"
             inputs:
@@ -197,15 +229,15 @@ stages:
   - stage: Apply
     displayName: "Terraform Apply"
     dependsOn: Plan
-    # Only auto-run on main; feature/develop branches stop after Plan
+    # Only run on main branch; feature/develop branches stop after Plan
     condition: |
       and(
         succeeded(),
         eq(variables['Build.SourceBranch'], 'refs/heads/main')
       )
     jobs:
-      # The 'production' environment has an Approvals check configured –
-      # the pipeline pauses here until a reviewer approves.
+      # 'production' environment has Approvals check configured –
+      # pipeline pauses here until a reviewer approves in ADO.
       - deployment: TerraformApply
         displayName: "terraform apply"
         environment: "production"
@@ -220,15 +252,26 @@ stages:
 
                 - bash: |
                     set -euo pipefail
-                    echo "Installing Terraform $(TF_VERSION)..."
-                    curl -fsSL "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip" \
-                      -o /tmp/terraform.zip
-                    unzip -o /tmp/terraform.zip -d /tmp
-                    sudo mv /tmp/terraform /usr/local/bin/terraform
-                    terraform version
+                    TF_VER="$(TF_VERSION)"
+                    TF_DIR="$HOME/.terraform-bin"
+                    mkdir -p "$TF_DIR"
+
+                    if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OS" == "Windows_NT" ]]; then
+                      PLATFORM="windows_amd64"; EXT=".exe"
+                    else
+                      PLATFORM="linux_amd64"; EXT=""
+                    fi
+
+                    echo "Installing Terraform $TF_VER for $PLATFORM..."
+                    curl -fsSL \
+                      "https://releases.hashicorp.com/terraform/${TF_VER}/terraform_${TF_VER}_${PLATFORM}.zip" \
+                      -o "$TF_DIR/terraform.zip"
+                    unzip -o "$TF_DIR/terraform.zip" -d "$TF_DIR"
+                    echo "##vso[task.prependpath]$TF_DIR"
+                    "$TF_DIR/terraform${EXT}" version
                   displayName: "Install Terraform $(TF_VERSION)"
 
-                # Download plan artifact produced by the Plan stage
+                # Download plan artifact from the Plan stage
                 - task: DownloadPipelineArtifact@2
                   displayName: "Download plan artifact"
                   inputs:
@@ -249,6 +292,9 @@ stages:
                       export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
                       export ARM_TENANT_ID=$(ARM_TENANT_ID)
 
+                      TF_DIR="$HOME/.terraform-bin"
+                      export PATH="$TF_DIR:$PATH"
+
                       cd "$(TF_WORKING_DIR)"
 
                       echo "--- terraform init ---"
@@ -259,7 +305,8 @@ stages:
                         -backend-config="key=$(BACKEND_KEY)"
 
                       echo "--- terraform apply ---"
-                      terraform apply -auto-approve "$(Pipeline.Workspace)/tfplan/tfplan"
+                      terraform apply -auto-approve \
+                        "$(Pipeline.Workspace)/tfplan/tfplan"
 
                       echo ""
                       echo "=== Terraform Outputs ==="
