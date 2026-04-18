@@ -1,7 +1,8 @@
 # ============================================================
 # Azure DevOps Pipeline – IAC_AZURE_AUTOMATION_PIPELINE
 # Trigger: push / PR to main branch of the GitHub repo
-# Stages: Validate → Plan → Apply (gated)
+# Stages: Validate → Plan → Apply (gated on main)
+# Uses only built-in ADO tasks – no marketplace extensions required.
 # ============================================================
 
 trigger:
@@ -26,22 +27,22 @@ pr:
 
 # ── Variables ─────────────────────────────────────────────────────────────────
 variables:
-  # Pull ARM_*, TF_BACKEND_*, and SSH_PUBLIC_KEY from the 'terraform-backend' variable group
+  # Pull ARM_*, TF_BACKEND_*, and SSH_PUBLIC_KEY from the variable group
   - group: terraform-backend
 
-  # Azure service connection name (set in Project Settings → Service Connections)
+  # Azure service connection (Project Settings → Service Connections)
   - name: AZURE_SERVICE_CONNECTION
     value: "azure-service-connection"
 
-  # Terraform version to install
+  # Terraform version
   - name: TF_VERSION
     value: "1.9.8"
 
-  # Working directory – relative path inside the repo
+  # Working directory inside the repo
   - name: TF_WORKING_DIR
     value: "$(System.DefaultWorkingDirectory)"
 
-  # Azure Blob backend – mapped from variable group values
+  # Backend config – values come from the variable group above
   - name: BACKEND_RESOURCE_GROUP
     value: "$(TF_BACKEND_RG)"
   - name: BACKEND_STORAGE_ACCOUNT
@@ -51,14 +52,16 @@ variables:
   - name: BACKEND_KEY
     value: "IAC_azure_automation_pipeline/terraform.tfstate"
 
-  # SSH public key for VM – from variable group secret SSH_PUBLIC_KEY
-  # Leave empty to let the module auto-generate a password instead.
+  # SSH key – leave blank to use auto-generated password auth
   - name: TF_VAR_ssh_public_key
     value: "$(SSH_PUBLIC_KEY)"
 
 # ── Pool ──────────────────────────────────────────────────────────────────────
 pool:
   vmImage: "ubuntu-latest"
+
+# ── Shared step template: install Terraform ───────────────────────────────────
+# Referenced in each stage via a bash step (no marketplace extension needed).
 
 # ── Stages ────────────────────────────────────────────────────────────────────
 stages:
@@ -71,47 +74,50 @@ stages:
         displayName: "fmt + validate"
         steps:
 
-          # 1. Checkout from GitHub
           - checkout: self
             displayName: "Checkout source from GitHub"
             fetchDepth: 0
 
-          # 2. Install Terraform
-          - task: TerraformInstaller@1
+          # Install Terraform from HashiCorp releases (no marketplace needed)
+          - bash: |
+              set -euo pipefail
+              echo "Installing Terraform $(TF_VERSION)..."
+              curl -fsSL "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip" \
+                -o /tmp/terraform.zip
+              unzip -o /tmp/terraform.zip -d /tmp
+              sudo mv /tmp/terraform /usr/local/bin/terraform
+              terraform version
             displayName: "Install Terraform $(TF_VERSION)"
-            inputs:
-              terraformVersion: "$(TF_VERSION)"
 
-          # 3. terraform init (read-only – no backend state operations)
-          - task: TerraformTaskV4@4
-            displayName: "terraform init"
+          # terraform init + fmt + validate via AzureCLI@2 (built-in)
+          - task: AzureCLI@2
+            displayName: "terraform init + fmt + validate"
             inputs:
-              provider: "azurerm"
-              command: "init"
-              workingDirectory: "$(TF_WORKING_DIR)"
-              backendServiceArm: "$(AZURE_SERVICE_CONNECTION)"
-              backendAzureRmResourceGroupName: "$(BACKEND_RESOURCE_GROUP)"
-              backendAzureRmStorageAccountName: "$(BACKEND_STORAGE_ACCOUNT)"
-              backendAzureRmContainerName: "$(BACKEND_CONTAINER)"
-              backendAzureRmKey: "$(BACKEND_KEY)"
+              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                export ARM_TENANT_ID=$(ARM_TENANT_ID)
 
-          # 4. terraform fmt check
-          - task: TerraformTaskV4@4
-            displayName: "terraform fmt -check"
-            inputs:
-              provider: "azurerm"
-              command: "custom"
-              workingDirectory: "$(TF_WORKING_DIR)"
-              customCommand: "fmt"
-              commandOptions: "-check -recursive -diff"
+                cd "$(TF_WORKING_DIR)"
 
-          # 5. terraform validate
-          - task: TerraformTaskV4@4
-            displayName: "terraform validate"
-            inputs:
-              provider: "azurerm"
-              command: "validate"
-              workingDirectory: "$(TF_WORKING_DIR)"
+                echo "--- terraform init ---"
+                terraform init \
+                  -backend-config="resource_group_name=$(BACKEND_RESOURCE_GROUP)" \
+                  -backend-config="storage_account_name=$(BACKEND_STORAGE_ACCOUNT)" \
+                  -backend-config="container_name=$(BACKEND_CONTAINER)" \
+                  -backend-config="key=$(BACKEND_KEY)"
+
+                echo "--- terraform fmt ---"
+                terraform fmt -check -recursive -diff
+
+                echo "--- terraform validate ---"
+                terraform validate
 
   # ── Stage 2: Plan ────────────────────────────────────────────────────────────
   - stage: Plan
@@ -127,39 +133,59 @@ stages:
             displayName: "Checkout source from GitHub"
             fetchDepth: 0
 
-          - task: TerraformInstaller@1
+          - bash: |
+              set -euo pipefail
+              echo "Installing Terraform $(TF_VERSION)..."
+              curl -fsSL "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip" \
+                -o /tmp/terraform.zip
+              unzip -o /tmp/terraform.zip -d /tmp
+              sudo mv /tmp/terraform /usr/local/bin/terraform
+              terraform version
             displayName: "Install Terraform $(TF_VERSION)"
-            inputs:
-              terraformVersion: "$(TF_VERSION)"
 
-          - task: TerraformTaskV4@4
-            displayName: "terraform init"
+          - task: AzureCLI@2
+            displayName: "terraform init + plan"
             inputs:
-              provider: "azurerm"
-              command: "init"
-              workingDirectory: "$(TF_WORKING_DIR)"
-              backendServiceArm: "$(AZURE_SERVICE_CONNECTION)"
-              backendAzureRmResourceGroupName: "$(BACKEND_RESOURCE_GROUP)"
-              backendAzureRmStorageAccountName: "$(BACKEND_STORAGE_ACCOUNT)"
-              backendAzureRmContainerName: "$(BACKEND_CONTAINER)"
-              backendAzureRmKey: "$(BACKEND_KEY)"
+              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                export ARM_TENANT_ID=$(ARM_TENANT_ID)
 
-          - task: TerraformTaskV4@4
-            displayName: "terraform plan"
-            inputs:
-              provider: "azurerm"
-              command: "plan"
-              workingDirectory: "$(TF_WORKING_DIR)"
-              environmentServiceNameAzureRM: "$(AZURE_SERVICE_CONNECTION)"
-              commandOptions: >-
-                -out=$(Pipeline.Workspace)/tfplan
-                -var="ssh_public_key=$(TF_VAR_ssh_public_key)"
-                -detailed-exitcode
-            env:
-              ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
-              ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+                cd "$(TF_WORKING_DIR)"
 
-          # Publish the plan file so the Apply stage can consume it
+                echo "--- terraform init ---"
+                terraform init \
+                  -backend-config="resource_group_name=$(BACKEND_RESOURCE_GROUP)" \
+                  -backend-config="storage_account_name=$(BACKEND_STORAGE_ACCOUNT)" \
+                  -backend-config="container_name=$(BACKEND_CONTAINER)" \
+                  -backend-config="key=$(BACKEND_KEY)"
+
+                echo "--- terraform plan ---"
+                # -detailed-exitcode: 0=no changes, 1=error, 2=changes present
+                terraform plan \
+                  -out="$(Pipeline.Workspace)/tfplan" \
+                  -var="ssh_public_key=$(TF_VAR_ssh_public_key)" \
+                  -detailed-exitcode || PLAN_EXIT=$?
+
+                # Exit code 2 means "changes to apply" – not an error
+                if [ "${PLAN_EXIT:-0}" -eq 2 ]; then
+                  echo "Plan has changes. Proceeding."
+                elif [ "${PLAN_EXIT:-0}" -eq 1 ]; then
+                  echo "Plan failed." && exit 1
+                fi
+
+                echo "--- terraform show (human-readable summary) ---"
+                terraform show -no-color "$(Pipeline.Workspace)/tfplan" \
+                  | tee "$(Pipeline.Workspace)/tfplan.txt"
+                echo "##vso[task.uploadsummary]$(Pipeline.Workspace)/tfplan.txt"
+
+          # Publish plan binary as pipeline artifact for the Apply stage
           - task: PublishPipelineArtifact@1
             displayName: "Publish plan artifact"
             inputs:
@@ -167,26 +193,19 @@ stages:
               artifact: "tfplan"
               publishLocation: "pipeline"
 
-          # Save the full plan output as a readable summary
-          - bash: |
-              cd "$(TF_WORKING_DIR)"
-              terraform show -no-color $(Pipeline.Workspace)/tfplan > $(Pipeline.Workspace)/tfplan.txt
-              echo "##vso[task.uploadsummary]$(Pipeline.Workspace)/tfplan.txt"
-            displayName: "Show plan summary"
-
-  # ── Stage 3: Apply (manual approval gate on main branch) ─────────────────────
+  # ── Stage 3: Apply (manual approval gate on main) ─────────────────────────
   - stage: Apply
     displayName: "Terraform Apply"
     dependsOn: Plan
-    # Only auto-run on main; feature branches stop after Plan
+    # Only auto-run on main; feature/develop branches stop after Plan
     condition: |
       and(
         succeeded(),
         eq(variables['Build.SourceBranch'], 'refs/heads/main')
       )
     jobs:
-      # Approval gate – requires an environment named 'production' in Azure DevOps
-      # with an Approvals check configured (Project Settings → Environments).
+      # The 'production' environment has an Approvals check configured –
+      # the pipeline pauses here until a reviewer approves.
       - deployment: TerraformApply
         displayName: "terraform apply"
         environment: "production"
@@ -199,48 +218,49 @@ stages:
                   displayName: "Checkout source from GitHub"
                   fetchDepth: 0
 
-                - task: TerraformInstaller@1
+                - bash: |
+                    set -euo pipefail
+                    echo "Installing Terraform $(TF_VERSION)..."
+                    curl -fsSL "https://releases.hashicorp.com/terraform/$(TF_VERSION)/terraform_$(TF_VERSION)_linux_amd64.zip" \
+                      -o /tmp/terraform.zip
+                    unzip -o /tmp/terraform.zip -d /tmp
+                    sudo mv /tmp/terraform /usr/local/bin/terraform
+                    terraform version
                   displayName: "Install Terraform $(TF_VERSION)"
-                  inputs:
-                    terraformVersion: "$(TF_VERSION)"
 
-                - task: TerraformTaskV4@4
-                  displayName: "terraform init"
-                  inputs:
-                    provider: "azurerm"
-                    command: "init"
-                    workingDirectory: "$(TF_WORKING_DIR)"
-                    backendServiceArm: "$(AZURE_SERVICE_CONNECTION)"
-                    backendAzureRmResourceGroupName: "$(BACKEND_RESOURCE_GROUP)"
-                    backendAzureRmStorageAccountName: "$(BACKEND_CONTAINER)"
-                    backendAzureRmContainerName: "$(BACKEND_CONTAINER)"
-                    backendAzureRmKey: "$(BACKEND_KEY)"
-
-                # Download the plan file created in the Plan stage
+                # Download plan artifact produced by the Plan stage
                 - task: DownloadPipelineArtifact@2
                   displayName: "Download plan artifact"
                   inputs:
                     artifact: "tfplan"
                     path: "$(Pipeline.Workspace)/tfplan"
 
-                - task: TerraformTaskV4@4
-                  displayName: "terraform apply"
+                - task: AzureCLI@2
+                  displayName: "terraform init + apply"
                   inputs:
-                    provider: "azurerm"
-                    command: "apply"
-                    workingDirectory: "$(TF_WORKING_DIR)"
-                    environmentServiceNameAzureRM: "$(AZURE_SERVICE_CONNECTION)"
-                    commandOptions: "-auto-approve $(Pipeline.Workspace)/tfplan"
-                  env:
-                    ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
-                    ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+                    azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_CLIENT_SECRET=$servicePrincipalKey
+                      export ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                      export ARM_TENANT_ID=$(ARM_TENANT_ID)
 
-                # Print sensitive outputs (masked by ADO secret variable handling)
-                - bash: |
-                    cd "$(TF_WORKING_DIR)"
-                    echo "=== Terraform Outputs ==="
-                    terraform output -json
-                  displayName: "Show Terraform outputs"
-                  env:
-                    ARM_SUBSCRIPTION_ID: "$(ARM_SUBSCRIPTION_ID)"
-                    ARM_TENANT_ID: "$(ARM_TENANT_ID)"
+                      cd "$(TF_WORKING_DIR)"
+
+                      echo "--- terraform init ---"
+                      terraform init \
+                        -backend-config="resource_group_name=$(BACKEND_RESOURCE_GROUP)" \
+                        -backend-config="storage_account_name=$(BACKEND_STORAGE_ACCOUNT)" \
+                        -backend-config="container_name=$(BACKEND_CONTAINER)" \
+                        -backend-config="key=$(BACKEND_KEY)"
+
+                      echo "--- terraform apply ---"
+                      terraform apply -auto-approve "$(Pipeline.Workspace)/tfplan/tfplan"
+
+                      echo ""
+                      echo "=== Terraform Outputs ==="
+                      terraform output -json
